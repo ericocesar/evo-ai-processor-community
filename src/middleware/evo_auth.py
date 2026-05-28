@@ -54,6 +54,39 @@ class EvoAuthMiddleware(BaseHTTPMiddleware):
         super().__init__(app)
         logger.info("EvoAuth middleware initialized")
     
+    async def _try_agent_api_key_auth(self, request: Request, token: str, agent_id: str = None) -> Optional[bool]:
+        if not agent_id:
+            agent_id = self._extract_agent_id_from_path(request.url.path)
+        if not agent_id:
+            return None
+        logger.info(f"EvoAuth: Trying Agent API Key validation for agent {agent_id}")
+        db = next(get_db())
+        try:
+            validation_result = await agent_service.validate_agent_api_key(
+                db, agent_id, token
+            )
+            if validation_result and validation_result.get("valid"):
+                agent_context = {
+                    "agent_id": validation_result.get("agent_id"),
+                    "agent_name": validation_result.get("agent_name"),
+                    "is_agent_bot": True,
+                    "token_info": {
+                        "access_token": token,
+                        "type": "agent_api_key"
+                    }
+                }
+                request.state.user_context = agent_context
+                request.state.current_user = agent_context
+                logger.info(
+                    f"EvoAuth: Successfully authenticated Agent Bot {validation_result.get('agent_name')} via API key"
+                )
+                return True
+        except Exception as e:
+            logger.warning(f"EvoAuth: Agent API Key validation failed: {e}")
+        finally:
+            db.close()
+        return False
+
     async def dispatch(self, request: Request, call_next):
         # Skip OPTIONS requests (CORS preflight)
         if request.method == "OPTIONS":
@@ -63,46 +96,18 @@ class EvoAuthMiddleware(BaseHTTPMiddleware):
         if self._should_skip(request.url.path):
             return await call_next(request)
         
-        # For /sync/ routes, check X-API-Key header first (for agent bot authentication)
-        if '/sync/' in request.url.path:
-            x_api_key = request.headers.get("x-api-key")
-            if x_api_key:
-                # Extract agent_id from session_id in path
+        # Early X-API-Key check for agent bot authentication (all routes)
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            agent_id = None
+            if '/sync/' in request.url.path:
                 agent_id = self._extract_agent_id_from_sync_path(request.url.path)
-                if agent_id:
-                    logger.info(f"EvoAuth: /sync/ route detected, validating Agent API Key for agent {agent_id}")
-                    db = next(get_db())
-                    try:
-                        validation_result = await agent_service.validate_agent_api_key(
-                            db, agent_id, x_api_key
-                        )
-
-                        if validation_result and validation_result.get("valid"):
-                            # Create agent context
-                            agent_context = {
-                                "agent_id": validation_result.get("agent_id"),
-                                "agent_name": validation_result.get("agent_name"),
-                                "is_agent_bot": True,
-                                "token_info": {
-                                    "access_token": x_api_key,
-                                    "type": "agent_api_key"
-                                }
-                            }
-
-                            request.state.user_context = agent_context
-                            request.state.current_user = agent_context
-
-                            logger.info(
-                                f"EvoAuth: Successfully authenticated Agent Bot {validation_result.get('agent_name')} via X-API-Key for /sync/ route"
-                            )
-
-                            return await call_next(request)
-                    except Exception as e:
-                        logger.warning(f"EvoAuth: Agent API Key validation failed for /sync/ route: {e}")
-                    finally:
-                        db.close()
-                else:
-                    logger.warning(f"EvoAuth: Could not extract agent_id from /sync/ path: {request.url.path}")
+            result = await self._try_agent_api_key_auth(request, x_api_key, agent_id)
+            if result is True:
+                return await call_next(request)
+            if result is False:
+                return self._unauthorized_response(request, "Invalid agent API key")
+            logger.warning(f"EvoAuth: Could not extract agent_id from path: {request.url.path}")
         
         # Extract token
         token, token_type = self._extract_token(request)

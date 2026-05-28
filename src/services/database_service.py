@@ -38,7 +38,8 @@ class DatabaseService:
                 asyncpg_connection_string,
                 min_size=1,
                 max_size=10,
-                command_timeout=60
+                command_timeout=60,
+                max_inactive_connection_lifetime=300.0,
             )
         return self._pool
 
