@@ -38,21 +38,24 @@ execution_metrics = sa.Table(
 
 def upgrade() -> None:
     """Upgrade schema."""
-    op.create_table(
-        'evo_agent_processor_execution_metrics',
-        sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column('agent_id', postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column('session_id', sa.String(), nullable=False),
-        sa.Column('user_id', sa.String(), nullable=False),
-        sa.Column('llm_model', sa.String(), nullable=False),
-        sa.Column('prompt_tokens', sa.Integer(), nullable=False),
-        sa.Column('candidate_tokens', sa.Integer(), nullable=False),
-        sa.Column('cost', sa.Float(), nullable=False),
-        sa.Column('total_tokens', sa.Integer(), nullable=False),
-        sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
-        sa.ForeignKeyConstraint(['agent_id'], ['evo_core_agents.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('id')
-    )
+    conn = op.get_bind()
+    inspector = sa.inspect(conn)
+    if not inspector.has_table('evo_agent_processor_execution_metrics'):
+        op.create_table(
+            'evo_agent_processor_execution_metrics',
+            sa.Column('id', postgresql.UUID(as_uuid=True), nullable=False),
+            sa.Column('agent_id', postgresql.UUID(as_uuid=True), nullable=True),
+            sa.Column('session_id', sa.String(), nullable=False),
+            sa.Column('user_id', sa.String(), nullable=False),
+            sa.Column('llm_model', sa.String(), nullable=False),
+            sa.Column('prompt_tokens', sa.Integer(), nullable=False),
+            sa.Column('candidate_tokens', sa.Integer(), nullable=False),
+            sa.Column('cost', sa.Float(), nullable=False),
+            sa.Column('total_tokens', sa.Integer(), nullable=False),
+            sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
+            sa.ForeignKeyConstraint(['agent_id'], ['evo_core_agents.id'], ondelete='CASCADE'),
+            sa.PrimaryKeyConstraint('id')
+        )
 
 
 def downgrade() -> None:

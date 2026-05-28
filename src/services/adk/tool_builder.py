@@ -481,6 +481,25 @@ class ToolBuilder:
             except Exception as e:
                 logger.error(f"Error creating knowledge_nexus_search tool: {e}")
 
+        # Process ViaCEP integration
+        via_cep_config = integrations.get("via_cep") or integrations.get("via-cep")
+        if via_cep_config and via_cep_config.get("enabled", False):
+            try:
+                from src.services.adk.tools.via_cep import create_via_cep_tool
+                self.tools.append(create_via_cep_tool())
+                logger.info("Added via_cep tool from ViaCEP integration")
+            except Exception as e:
+                logger.error(f"Error creating via_cep tool from ViaCEP integration: {e}")
+
+        # Also support enable_via_cep flag for simpler activation
+        if agent_config.get("enable_via_cep", False):
+            try:
+                from src.services.adk.tools.via_cep import create_via_cep_tool
+                self.tools.append(create_via_cep_tool())
+                logger.info("Added via_cep tool (enable_via_cep flag)")
+            except Exception as e:
+                logger.error(f"Error creating via_cep tool: {e}")
+
         # Process Google Calendar integration
         logger.debug(f"Checking Google Calendar integration. Integrations keys: {list(integrations.keys()) if integrations else 'None'}")
         google_calendar_config = integrations.get("google-calendar") or integrations.get("google_calendar")

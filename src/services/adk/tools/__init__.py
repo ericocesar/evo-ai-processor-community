@@ -4,6 +4,7 @@ This module contains the tools for the ADK.
 
 from .exit_loop import exit_loop
 from .text_to_speech import create_text_to_speech_tool
+from .via_cep import create_via_cep_tool
 
 # CRM tools are imported conditionally to avoid circular imports
 # They are accessed via: from src.services.adk.tools.evo_crm import create_transfer_to_human_tool
@@ -20,4 +21,5 @@ from .text_to_speech import create_text_to_speech_tool
 __all__ = [
     "exit_loop",
     "create_text_to_speech_tool",
+    "create_via_cep_tool",
 ]
