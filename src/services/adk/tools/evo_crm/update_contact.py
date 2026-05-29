@@ -231,7 +231,7 @@ def create_update_contact_tool() -> FunctionTool:
                 "error": str(e),
             }
 
-    update_contact.__name__ = "update_contact"
+    update_contact.__name__ = "update_contact_attributes"
     update_contact.__doc__ = """Update contact information in the CRM.
     
     Use this tool to update contact details such as name, email, phone number,

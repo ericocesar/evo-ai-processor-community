@@ -500,6 +500,25 @@ class ToolBuilder:
             except Exception as e:
                 logger.error(f"Error creating via_cep tool: {e}")
 
+        # Fatura de energia parser tool — activated via Integrations menu (fatura-parser)
+        fatura_parser_config = integrations.get("fatura-parser") or integrations.get("fatura_parser")
+        if fatura_parser_config and fatura_parser_config.get("enabled", False):
+            try:
+                from src.services.adk.tools.fatura_energia import create_parse_fatura_tool
+                self.tools.append(create_parse_fatura_tool())
+                logger.info("Added parse_fatura_energia tool from fatura-parser integration")
+            except Exception as e:
+                logger.error(f"Error creating parse_fatura_energia tool from integration: {e}")
+
+        # Also support enable_fatura_parser flag for simpler activation (legacy)
+        if agent_config.get("enable_fatura_parser", False):
+            try:
+                from src.services.adk.tools.fatura_energia import create_parse_fatura_tool
+                self.tools.append(create_parse_fatura_tool())
+                logger.info("Added parse_fatura_energia tool (enable_fatura_parser flag)")
+            except Exception as e:
+                logger.error(f"Error creating parse_fatura_energia tool: {e}")
+
         # Process Google Calendar integration
         logger.debug(f"Checking Google Calendar integration. Integrations keys: {list(integrations.keys()) if integrations else 'None'}")
         google_calendar_config = integrations.get("google-calendar") or integrations.get("google_calendar")
