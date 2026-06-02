@@ -90,8 +90,8 @@ def create_update_contact_tool() -> FunctionTool:
             location: Contact's location/address (optional)
             industry: Contact's industry (optional)
             tax_id: Contact's tax ID (optional, max 14 characters)
-            custom_attributes: Dictionary of custom attributes to update (optional)
-            additional_attributes: Dictionary of additional attributes to update (optional)
+            custom_attributes: Dictionary of custom attributes to update (optional). Use this for all business and contact fields (e.g., tipo_cliente, concessionaria, cep, cidade, estado, rua, bairro, numero_casa, complemento_endereco, valor_medio_conta, economia_mensal, ganho, uc_numero, cpf_titular, nome_titular, data_nascimento_titular).
+            additional_attributes: Dictionary of additional system/integration attributes (optional). Do NOT use this for custom contact fields.
             labels: List of label names to add to the contact (optional)
             contact_id: The ID of the contact to update (optional, will be automatically extracted from context)
             tool_context: The tool context containing session information (automatically provided)
@@ -140,10 +140,58 @@ def create_update_contact_tool() -> FunctionTool:
                 request_body["industry"] = industry
             if tax_id is not None:
                 request_body["tax_id"] = tax_id
+            # Defensive check: if the agent incorrectly passed defined custom attributes
+            # inside additional_attributes, automatically move them to custom_attributes.
+            if additional_attributes:
+                known_custom_keys = {
+                    "tipo_cliente", "nome_titular", "cpf_titular", "data_nascimento_titular",
+                    "uc_numero", "concessionaria", "cep", "estado", "cidade", "bairro", "rua",
+                    "numero_casa", "complemento_endereco", "valor_medio_conta", "economia_mensal",
+                    "ganho", "interesse_continuar", "qualificacao_energia", "economia_estimada_10",
+                    "tipo_ligacao"
+                }
+                
+                if custom_attributes is None:
+                    custom_attributes = {}
+                
+                # Move keys
+                keys_to_move = [k for k in list(additional_attributes.keys()) if k in known_custom_keys]
+                for k in keys_to_move:
+                    logger.warning(
+                        f"[update_contact] Defensive check: moving key '{k}' "
+                        f"from additional_attributes to custom_attributes."
+                    )
+                    custom_attributes[k] = additional_attributes.pop(k)
+                
+                # Clear additional_attributes if now empty
+                if not additional_attributes:
+                    additional_attributes = None
+
             if custom_attributes is not None:
-                request_body["custom_attributes"] = custom_attributes
+                # Filter out None and empty/blank strings
+                cleaned_custom = {}
+                for k, v in custom_attributes.items():
+                    if v is not None:
+                        if isinstance(v, str):
+                            if v.strip() != "":
+                                cleaned_custom[k] = v.strip()
+                        else:
+                            cleaned_custom[k] = v
+                if cleaned_custom:
+                    request_body["custom_attributes"] = cleaned_custom
+                
             if additional_attributes is not None:
-                request_body["additional_attributes"] = additional_attributes
+                # Filter out None and empty/blank strings
+                cleaned_additional = {}
+                for k, v in additional_attributes.items():
+                    if v is not None:
+                        if isinstance(v, str):
+                            if v.strip() != "":
+                                cleaned_additional[k] = v.strip()
+                        else:
+                            cleaned_additional[k] = v
+                if cleaned_additional:
+                    request_body["additional_attributes"] = cleaned_additional
             if labels is not None:
                 request_body["labels"] = labels
             
@@ -252,8 +300,8 @@ def create_update_contact_tool() -> FunctionTool:
         location: Contact's location/address (optional)
         industry: Contact's industry (optional)
         tax_id: Contact's tax ID (optional, max 14 characters)
-        custom_attributes: Dictionary of custom attributes to update (optional)
-        additional_attributes: Dictionary of additional attributes to update (optional)
+        custom_attributes: Dictionary of custom attributes to update (optional). Use this for all business and contact fields (e.g. tipo_cliente, concessionaria, cep, cidade, estado, rua, bairro, numero_casa, complemento_endereco, valor_medio_conta, economia_mensal, ganho, uc_numero, cpf_titular, nome_titular, data_nascimento_titular).
+        additional_attributes: Dictionary of additional system/integration attributes (optional). Do NOT use this for custom contact fields.
         labels: List of label names to add to the contact (optional)
         contact_id: The ID of the contact to update (required, auto-extracted if not provided)
     

@@ -52,7 +52,9 @@ dependencies = [
     "langgraph==0.4.1",
     "litellm>=1.68.0,<1.69.0",
     "greenlet==3.2.3",
-    "psutil==5.9.8"
+    "psutil==5.9.8",
+    "pdfplumber==0.11.4",
+    "pymupdf==1.26.1"
 ]
 
 [project.optional-dependencies]

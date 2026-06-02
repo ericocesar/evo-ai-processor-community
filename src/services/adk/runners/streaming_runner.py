@@ -31,8 +31,8 @@ from google.adk.sessions import DatabaseSessionService
 from google.adk.memory.base_memory_service import BaseMemoryService
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from src.utils.logger import setup_logger
-from src.core.exceptions import AgentNotFoundError, InternalServerError
-from src.services.adk.runners.runner_utils import RunnerUtils, convert_sets
+from src.core.exceptions import AgentNotFoundError, InternalServerError, LLMRateLimitError
+from src.services.adk.runners.runner_utils import RunnerUtils, convert_sets, is_rate_limit_error, is_file_unsupported_error, is_llm_response_parse_error
 from src.services.session_service import create_execution_metrics
 from src.schemas.schemas import ExecutionMetricsCreate
 from sqlalchemy.orm import Session
@@ -42,6 +42,9 @@ import json
 import uuid
 
 logger = setup_logger(__name__)
+
+RETRY_MAX_ATTEMPTS = 3
+RETRY_INITIAL_DELAY = 2.0
 
 
 class StreamingRunner:
@@ -393,137 +396,213 @@ class StreamingRunner:
 
             logger.info("Starting agent streaming execution")
 
-            try:
-                total_prompt_tokens = 0
-                total_candidate_tokens = 0
-                total_tokens = 0
-                # Start the agent execution
-                events_async = agent_runner.run_async(
-                    user_id=effective_user_id,
-                    session_id=adk_session_id,
-                    new_message=content,
-                )
+            total_prompt_tokens = 0
+            total_candidate_tokens = 0
+            total_tokens = 0
 
-                # Stream events
-                async for event in events_async:
-                    try:
-                        if event.usage_metadata:
-                            total_prompt_tokens += (
-                                event.usage_metadata.prompt_token_count or 0
-                            )
-                            total_candidate_tokens += (
-                                event.usage_metadata.candidates_token_count or 0
-                            )
-                            total_tokens += event.usage_metadata.total_token_count or 0
+            # current_content may be downgraded to text-only on file-unsupported errors
+            current_content = content
+            _file_parts_stripped = False
 
-                        # Handle both Pydantic v2 (model_dump) and older versions
-                        if hasattr(event, "model_dump"):
-                            event_dict = event.model_dump()
-                        elif hasattr(event, "dict"):
-                            event_dict = event.dict()
-                        else:
-                            event_dict = event.__dict__
-                        event_dict = convert_sets(event_dict)
-
-                        # Validate and fix event content structure
-                        event_dict = self._validate_event_content(event_dict)
-
-                        # Save event to memory individually (FIFO) if it has content
-                        if memory_service and hasattr(memory_service, "add_event_to_memory"):
-                            try:
-                                if event.content and event.content.parts:
-                                    # Extract text from event
-                                    event_text = ""
-                                    for part in event.content.parts:
-                                        if hasattr(part, "text") and part.text:
-                                            event_text += part.text + " "
-                                    event_text = event_text.strip()
-                                    
-                                    if event_text:
-                                        # Get agent from database to check if load_memory is enabled
-                                        from src.services.agent_service import get_agent
-                                        agent = await get_agent(self.db, agent_id)
-                                        
-                                        # Check if load_memory is enabled
-                                        load_memory_enabled = False
-                                        memory_base_config_id = None
-                                        short_term_max_messages = None
-                                        compression_interval = None
-
-                                        if agent:
-                                            if agent.config:
-                                                agent_config = agent.config if isinstance(agent.config, dict) else {}
-                                                if isinstance(agent_config, dict):
-                                                    load_memory_enabled = agent_config.get("load_memory", False)
-                                                    memory_base_config_id = agent_config.get("memory_base_config_id")
-                                                    short_term_max_messages = agent_config.get("memory_short_term_max_messages")
-                                                    compression_interval = agent_config.get("memory_medium_term_compression_interval")
-
-                                        # Only save to memory if load_memory is enabled
-                                        if load_memory_enabled:
-                                            # Determine role (agent response)
-                                            role = "agent"
-
-                                            await memory_service.add_event_to_memory(
-                                                app_name=agent_id,
-                                                user_id=effective_user_id,
-                                                role=role,
-                                                content=event_text,
-                                                memory_base_config_id=memory_base_config_id,
-                                                short_term_max_messages=short_term_max_messages,
-                                                compression_interval=compression_interval,
-                                            )
-                            except Exception as e:
-                                logger.debug(f"Could not save event to memory: {e}")
-
-                        yield json.dumps(event_dict)
-
-                    except (GeneratorExit, asyncio.CancelledError):
-                        logger.info("Client disconnected, stopping stream")
-                        break
-                    except Exception as e:
-                        logger.error(f"Error processing event: {e}")
-                        continue
-
-                logger.info(
-                    f"Session tokens: {total_tokens} (prompt={total_prompt_tokens},"
-                    f" candidates={total_candidate_tokens})"
-                )
-
-                # Create execution metrics
+            # Retry loop for transient LLM errors (rate limits, file-unsupported)
+            for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
                 try:
-                    # Handle both Pydantic v2 (model_dump) and older versions
-                    if hasattr(root_agent.model, "model_dump"):
-                        model_dict = root_agent.model.model_dump()
-                    elif hasattr(root_agent.model, "dict"):
-                        model_dict = root_agent.model.dict()
-                    else:
-                        model_dict = root_agent.model.__dict__
-                    model_str = model_dict.get("model", str(root_agent.model))
-                    metrics_data = ExecutionMetricsCreate(
-                        agent_id=uuid.UUID(agent_id),
-                        session_id=adk_session_id,
+                    # Start the agent execution
+                    events_async = agent_runner.run_async(
                         user_id=effective_user_id,
-                        llm_model=str(model_str),
-                        prompt_tokens=total_prompt_tokens,
-                        candidate_tokens=total_candidate_tokens,
-                        cost=0.0,
-                        total_tokens=total_tokens,
+                        session_id=adk_session_id,
+                        new_message=current_content,
                     )
-                    create_execution_metrics(self.db, metrics_data)
+
+                    # Stream events
+                    async for event in events_async:
+                        try:
+                            if event.usage_metadata:
+                                total_prompt_tokens += (
+                                    event.usage_metadata.prompt_token_count or 0
+                                )
+                                total_candidate_tokens += (
+                                    event.usage_metadata.candidates_token_count or 0
+                                )
+                                total_tokens += event.usage_metadata.total_token_count or 0
+
+                            # Handle both Pydantic v2 (model_dump) and older versions
+                            if hasattr(event, "model_dump"):
+                                event_dict = event.model_dump()
+                            elif hasattr(event, "dict"):
+                                event_dict = event.dict()
+                            else:
+                                event_dict = event.__dict__
+                            event_dict = convert_sets(event_dict)
+
+                            # Validate and fix event content structure
+                            event_dict = self._validate_event_content(event_dict)
+
+                            # Save event to memory individually (FIFO) if it has content
+                            if memory_service and hasattr(memory_service, "add_event_to_memory"):
+                                try:
+                                    if event.content and event.content.parts:
+                                        # Extract text from event
+                                        event_text = ""
+                                        for part in event.content.parts:
+                                            if hasattr(part, "text") and part.text:
+                                                event_text += part.text + " "
+                                        event_text = event_text.strip()
+                                        
+                                        if event_text:
+                                            # Get agent from database to check if load_memory is enabled
+                                            from src.services.agent_service import get_agent
+                                            agent = await get_agent(self.db, agent_id)
+                                            
+                                            # Check if load_memory is enabled
+                                            load_memory_enabled = False
+                                            memory_base_config_id = None
+                                            short_term_max_messages = None
+                                            compression_interval = None
+
+                                            if agent:
+                                                if agent.config:
+                                                    agent_config = agent.config if isinstance(agent.config, dict) else {}
+                                                    if isinstance(agent_config, dict):
+                                                        load_memory_enabled = agent_config.get("load_memory", False)
+                                                        memory_base_config_id = agent_config.get("memory_base_config_id")
+                                                        short_term_max_messages = agent_config.get("memory_short_term_max_messages")
+                                                        compression_interval = agent_config.get("memory_medium_term_compression_interval")
+
+                                            # Only save to memory if load_memory is enabled
+                                            if load_memory_enabled:
+                                                # Determine role (agent response)
+                                                role = "agent"
+
+                                                await memory_service.add_event_to_memory(
+                                                    app_name=agent_id,
+                                                    user_id=effective_user_id,
+                                                    role=role,
+                                                    content=event_text,
+                                                    memory_base_config_id=memory_base_config_id,
+                                                    short_term_max_messages=short_term_max_messages,
+                                                    compression_interval=compression_interval,
+                                                )
+                                except Exception as e:
+                                    logger.debug(f"Could not save event to memory: {e}")
+
+                            yield json.dumps(event_dict)
+
+                        except (GeneratorExit, asyncio.CancelledError):
+                            logger.info("Client disconnected, stopping stream")
+                            break
+                        except Exception as e:
+                            logger.error(f"Error processing event: {e}")
+                            continue
+
+                    logger.info(
+                        f"Session tokens: {total_tokens} (prompt={total_prompt_tokens},"
+                        f" candidates={total_candidate_tokens})"
+                    )
+
+                    # Create execution metrics
+                    try:
+                        # Handle both Pydantic v2 (model_dump) and older versions
+                        if hasattr(root_agent.model, "model_dump"):
+                            model_dict = root_agent.model.model_dump()
+                        elif hasattr(root_agent.model, "dict"):
+                            model_dict = root_agent.model.dict()
+                        else:
+                            model_dict = root_agent.model.__dict__
+                        model_str = model_dict.get("model", str(root_agent.model))
+                        metrics_data = ExecutionMetricsCreate(
+                            agent_id=uuid.UUID(agent_id),
+                            session_id=adk_session_id,
+                            user_id=effective_user_id,
+                            llm_model=str(model_str),
+                            prompt_tokens=total_prompt_tokens,
+                            candidate_tokens=total_candidate_tokens,
+                            cost=0.0,
+                            total_tokens=total_tokens,
+                        )
+                        create_execution_metrics(self.db, metrics_data)
+                    except Exception as e:
+                        logger.error(f"Error creating execution metrics: {e}")
+
+                    # Note: We no longer save the entire session to memory at the end
+                    # Events are saved individually during execution (FIFO)
+                    logger.info("Agent streaming execution completed successfully")
+
+                    # Execution succeeded - exit retry loop
+                    break
+
+                except (GeneratorExit, asyncio.CancelledError):
+                    logger.info("Client disconnected during streaming")
+                    return
                 except Exception as e:
-                    logger.error(f"Error creating execution metrics: {e}")
-
-                # Note: We no longer save the entire session to memory at the end
-                # Events are saved individually during execution (FIFO)
-                logger.info("Agent streaming execution completed successfully")
-
-            except (GeneratorExit, asyncio.CancelledError):
-                logger.info("Client disconnected during streaming")
-                return
-            except Exception as e:
-                logger.error(f"Error in streaming: {str(e)}")
-                error_message = f"Error: {str(e)}"
+                    if is_rate_limit_error(e) and attempt < RETRY_MAX_ATTEMPTS:
+                        delay = RETRY_INITIAL_DELAY * (2 ** (attempt - 1))
+                        logger.warning(
+                            f"Rate limit detected on attempt {attempt}/{RETRY_MAX_ATTEMPTS} "
+                            f"for agent {agent_id}. Retrying in {delay:.1f}s... "
+                            f"Error: {str(e)[:200]}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if is_file_unsupported_error(e) and not _file_parts_stripped and file_parts:
+                        stripped = self.utils.strip_file_parts(current_content)
+                        if stripped:
+                            current_content = stripped
+                            _file_parts_stripped = True
+                            logger.warning(
+                                f"Model does not support file/image content "
+                                f"(attempt {attempt}). Retrying without file parts. "
+                                f"Error: {str(e)[:200]}"
+                            )
+                            continue
+                    if is_llm_response_parse_error(e):
+                        # LiteLLM could not deserialize the provider response
+                        # (e.g. unknown annotation type). Not retryable.
+                        logger.warning(
+                            f"LLM response parse error (LiteLLM/provider incompatibility). "
+                            f"Returning graceful error. Error: {str(e)[:300]}"
+                        )
+                        try:
+                            yield json.dumps(
+                                {
+                                    "role": "system",
+                                    "content": {
+                                        "role": "agent",
+                                        "parts": [
+                                            {
+                                                "type": "text",
+                                                "text": (
+                                                    "O modelo retornou uma resposta em formato não suportado "
+                                                    "pela versão atual do sistema. Por favor, tente novamente "
+                                                    "ou entre em contato com o suporte."
+                                                ),
+                                            }
+                                        ],
+                                    },
+                                }
+                            )
+                        except (GeneratorExit, asyncio.CancelledError):
+                            return
+                        return
+                    logger.error(f"Error in streaming: {str(e)}")
+                    error_message = f"Error: {str(e)}"
+                    try:
+                        yield json.dumps(
+                            {
+                                "role": "system",
+                                "content": {
+                                    "role": "agent",
+                                    "parts": [{"type": "text", "text": error_message}],
+                                },
+                            }
+                        )
+                    except (GeneratorExit, asyncio.CancelledError):
+                        return
+                    raise InternalServerError(str(e)) from e
+            else:
+                # All retries exhausted
+                error_message = f"LLM rate limit exceeded after {RETRY_MAX_ATTEMPTS} attempts"
+                logger.error(f"Error in streaming: {error_message}")
                 try:
                     yield json.dumps(
                         {
@@ -536,11 +615,16 @@ class StreamingRunner:
                     )
                 except (GeneratorExit, asyncio.CancelledError):
                     return
-                raise InternalServerError(str(e)) from e
+                raise LLMRateLimitError(
+                    f"LLM rate limit exceeded after {RETRY_MAX_ATTEMPTS} attempts for agent {agent_id}"
+                )
 
         except AgentNotFoundError as e:
             logger.error(f"Agent not found: {str(e)}")
             raise AgentNotFoundError(str(e))
+        except LLMRateLimitError as e:
+            logger.error(f"LLM rate limit: {str(e)}")
+            raise e
         except Exception as e:
             logger.error(f"Internal error processing request: {str(e)}", exc_info=True)
             raise InternalServerError(str(e))

@@ -31,8 +31,8 @@ from google.adk.sessions import DatabaseSessionService
 from google.adk.memory.base_memory_service import BaseMemoryService
 from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
 from src.utils.logger import setup_logger
-from src.core.exceptions import AgentNotFoundError, InternalServerError
-from src.services.adk.runners.runner_utils import RunnerUtils, convert_sets
+from src.core.exceptions import AgentNotFoundError, InternalServerError, LLMRateLimitError
+from src.services.adk.runners.runner_utils import RunnerUtils, convert_sets, is_rate_limit_error, is_llm_response_parse_error
 from sqlalchemy.orm import Session
 from typing import Optional, Dict, Any
 from src.services.session_service import create_execution_metrics
@@ -44,9 +44,13 @@ from src.evo_extension_points import (
     runtime_context,
     usage_reporter,
 )
+import asyncio
 import uuid
 
 logger = setup_logger(__name__)
+
+RETRY_MAX_ATTEMPTS = 3
+RETRY_INITIAL_DELAY = 2.0
 
 
 class StandardRunner:
@@ -387,152 +391,181 @@ class StandardRunner:
             final_response_text = "No response captured."
             message_history = []
 
-            try:
-                total_prompt_tokens = 0
-                total_candidate_tokens = 0
-                total_tokens = 0
+            total_prompt_tokens = 0
+            total_candidate_tokens = 0
+            total_tokens = 0
 
-                events_async = agent_runner.run_async(
-                    user_id=effective_user_id,
-                    session_id=adk_session_id,
-                    new_message=content,
-                )
-
-                async for event in events_async:
-                    if event.usage_metadata:
-                        total_prompt_tokens += (
-                            event.usage_metadata.prompt_token_count or 0
-                        )
-                        total_candidate_tokens += (
-                            event.usage_metadata.candidates_token_count or 0
-                        )
-                        total_tokens += event.usage_metadata.total_token_count or 0
-
-                    if event.content and event.content.parts:
-                        # Handle both Pydantic v2 (model_dump) and older versions
-                        if hasattr(event, "model_dump"):
-                            event_dict = event.model_dump()
-                        elif hasattr(event, "dict"):
-                            event_dict = event.dict()
-                        else:
-                            event_dict = event.__dict__
-                        event_dict = convert_sets(event_dict)
-                        message_history.append(event_dict)
-                        
-                        # Save event to memory individually (FIFO)
-                        if memory_service and hasattr(memory_service, "add_event_to_memory"):
-                            try:
-                                # Extract text from event
-                                event_text = ""
-                                if event.content.parts:
-                                    for part in event.content.parts:
-                                        if hasattr(part, "text") and part.text:
-                                            event_text += part.text + " "
-                                    event_text = event_text.strip()
-                                
-                                if event_text:
-                                    # Get agent from database to check if load_memory is enabled
-                                    from src.services.agent_service import get_agent
-                                    agent = await get_agent(self.db, agent_id)
-                                    
-                                    # Check if load_memory is enabled
-                                    load_memory_enabled = False
-                                    memory_base_config_id = None
-                                    short_term_max_messages = None
-                                    compression_interval = None
-
-                                    if agent:
-                                        if agent.config:
-                                            agent_config = agent.config if isinstance(agent.config, dict) else {}
-                                            if isinstance(agent_config, dict):
-                                                load_memory_enabled = agent_config.get("load_memory", False)
-                                                memory_base_config_id = agent_config.get("memory_base_config_id")
-                                                short_term_max_messages = agent_config.get("memory_short_term_max_messages")
-                                                compression_interval = agent_config.get("memory_medium_term_compression_interval")
-
-                                    # Only save to memory if load_memory is enabled
-                                    if load_memory_enabled:
-                                        # Determine role (agent response)
-                                        role = "agent"
-
-                                        await memory_service.add_event_to_memory(
-                                            app_name=agent_id,
-                                            user_id=effective_user_id,
-                                            role=role,
-                                            content=event_text,
-                                            memory_base_config_id=memory_base_config_id,
-                                            short_term_max_messages=short_term_max_messages,
-                                            compression_interval=compression_interval,
-                                        )
-                            except Exception as e:
-                                logger.debug(f"Could not save event to memory: {e}")
-
-                    if (
-                        event.content
-                        and event.content.parts
-                        and event.content.parts[0].text
-                    ):
-                        final_response_text = event.content.parts[0].text
-
-                    if event.actions and event.actions.escalate:
-                        final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
-                        break
-
-                logger.info(
-                    f"Session tokens: {total_tokens} (prompt={total_prompt_tokens},"
-                    f" candidates={total_candidate_tokens})"
-                )
-
+            # Retry loop for transient LLM errors (rate limits)
+            for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
                 try:
-                    if not hasattr(root_agent, "model"):
-                        model_str = "external"
-                    else:
-                        # Handle both Pydantic v2 (model_dump) and older versions
-                        if hasattr(root_agent.model, "model_dump"):
-                            model_dict = root_agent.model.model_dump()
-                        elif hasattr(root_agent.model, "dict"):
-                            model_dict = root_agent.model.dict()
-                        else:
-                            model_dict = root_agent.model.__dict__
-                        model_str = model_dict.get("model", str(root_agent.model))
-                    metrics_data = ExecutionMetricsCreate(
-                        agent_id=uuid.UUID(agent_id),
-                        session_id=adk_session_id,
+                    events_async = agent_runner.run_async(
                         user_id=effective_user_id,
-                        llm_model=str(model_str),
+                        session_id=adk_session_id,
+                        new_message=content,
+                    )
+
+                    async for event in events_async:
+                        if event.usage_metadata:
+                            total_prompt_tokens += (
+                                event.usage_metadata.prompt_token_count or 0
+                            )
+                            total_candidate_tokens += (
+                                event.usage_metadata.candidates_token_count or 0
+                            )
+                            total_tokens += event.usage_metadata.total_token_count or 0
+
+                        if event.content and event.content.parts:
+                            # Handle both Pydantic v2 (model_dump) and older versions
+                            if hasattr(event, "model_dump"):
+                                event_dict = event.model_dump()
+                            elif hasattr(event, "dict"):
+                                event_dict = event.dict()
+                            else:
+                                event_dict = event.__dict__
+                            event_dict = convert_sets(event_dict)
+                            message_history.append(event_dict)
+                            
+                            # Save event to memory individually (FIFO)
+                            if memory_service and hasattr(memory_service, "add_event_to_memory"):
+                                try:
+                                    # Extract text from event
+                                    event_text = ""
+                                    if event.content.parts:
+                                        for part in event.content.parts:
+                                            if hasattr(part, "text") and part.text:
+                                                event_text += part.text + " "
+                                        event_text = event_text.strip()
+                                    
+                                    if event_text:
+                                        # Get agent from database to check if load_memory is enabled
+                                        from src.services.agent_service import get_agent
+                                        agent = await get_agent(self.db, agent_id)
+                                        
+                                        # Check if load_memory is enabled
+                                        load_memory_enabled = False
+                                        memory_base_config_id = None
+                                        short_term_max_messages = None
+                                        compression_interval = None
+
+                                        if agent:
+                                            if agent.config:
+                                                agent_config = agent.config if isinstance(agent.config, dict) else {}
+                                                if isinstance(agent_config, dict):
+                                                    load_memory_enabled = agent_config.get("load_memory", False)
+                                                    memory_base_config_id = agent_config.get("memory_base_config_id")
+                                                    short_term_max_messages = agent_config.get("memory_short_term_max_messages")
+                                                    compression_interval = agent_config.get("memory_medium_term_compression_interval")
+
+                                        # Only save to memory if load_memory is enabled
+                                        if load_memory_enabled:
+                                            # Determine role (agent response)
+                                            role = "agent"
+
+                                            await memory_service.add_event_to_memory(
+                                                app_name=agent_id,
+                                                user_id=effective_user_id,
+                                                role=role,
+                                                content=event_text,
+                                                memory_base_config_id=memory_base_config_id,
+                                                short_term_max_messages=short_term_max_messages,
+                                                compression_interval=compression_interval,
+                                            )
+                                except Exception as e:
+                                    logger.debug(f"Could not save event to memory: {e}")
+
+                        if (
+                            event.content
+                            and event.content.parts
+                            and event.content.parts[0].text
+                        ):
+                            final_response_text = event.content.parts[0].text
+
+                        if event.actions and event.actions.escalate:
+                            final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
+                            break
+
+                    # Execution succeeded - exit retry loop
+                    break
+
+                except Exception as e:
+                    if is_rate_limit_error(e) and attempt < RETRY_MAX_ATTEMPTS:
+                        delay = RETRY_INITIAL_DELAY * (2 ** (attempt - 1))
+                        logger.warning(
+                            f"Rate limit detected on attempt {attempt}/{RETRY_MAX_ATTEMPTS} "
+                            f"for agent {agent_id}. Retrying in {delay:.1f}s... "
+                            f"Error: {str(e)[:200]}"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    if is_llm_response_parse_error(e):
+                        logger.warning(
+                            f"LLM response parse error (LiteLLM/provider incompatibility). "
+                            f"Returning graceful error. Error: {str(e)[:300]}"
+                        )
+                        final_response_text = (
+                            "O modelo retornou uma resposta em formato não suportado "
+                            "pela versão atual do sistema. Por favor, tente novamente "
+                            "ou entre em contato com o suporte."
+                        )
+                        break
+                    raise InternalServerError(str(e)) from e
+            else:
+                # All retries exhausted
+                raise LLMRateLimitError(
+                    f"LLM rate limit exceeded after {RETRY_MAX_ATTEMPTS} attempts for agent {agent_id}"
+                )
+
+            logger.info(
+                f"Session tokens: {total_tokens} (prompt={total_prompt_tokens},"
+                f" candidates={total_candidate_tokens})"
+            )
+
+            try:
+                if not hasattr(root_agent, "model"):
+                    model_str = "external"
+                else:
+                    # Handle both Pydantic v2 (model_dump) and older versions
+                    if hasattr(root_agent.model, "model_dump"):
+                        model_dict = root_agent.model.model_dump()
+                    elif hasattr(root_agent.model, "dict"):
+                        model_dict = root_agent.model.dict()
+                    else:
+                        model_dict = root_agent.model.__dict__
+                    model_str = model_dict.get("model", str(root_agent.model))
+                metrics_data = ExecutionMetricsCreate(
+                    agent_id=uuid.UUID(agent_id),
+                    session_id=adk_session_id,
+                    user_id=effective_user_id,
+                    llm_model=str(model_str),
+                    prompt_tokens=total_prompt_tokens,
+                    candidate_tokens=total_candidate_tokens,
+                    cost=0.0,
+                    total_tokens=total_tokens,
+                )
+                create_execution_metrics(self.db, metrics_data)
+            except Exception as e:
+                logger.error(f"Error creating execution metrics: {e}")
+
+            # Extension point: usage reporter. Always called after the
+            # local persistence above; default is a no-op. A misbehaving
+            # consumer cannot break the run — we swallow the exception
+            # and log with full context.
+            try:
+                usage_reporter.report_execution(
+                    ExecutionMetrics(
+                        execution_id=adk_session_id,
                         prompt_tokens=total_prompt_tokens,
                         candidate_tokens=total_candidate_tokens,
-                        cost=0.0,
                         total_tokens=total_tokens,
+                        cost=0.0,
                     )
-                    create_execution_metrics(self.db, metrics_data)
-                except Exception as e:
-                    logger.error(f"Error creating execution metrics: {e}")
-
-                # Extension point: usage reporter. Always called after the
-                # local persistence above; default is a no-op. A misbehaving
-                # consumer cannot break the run — we swallow the exception
-                # and log with full context.
-                try:
-                    usage_reporter.report_execution(
-                        ExecutionMetrics(
-                            execution_id=adk_session_id,
-                            prompt_tokens=total_prompt_tokens,
-                            candidate_tokens=total_candidate_tokens,
-                            total_tokens=total_tokens,
-                            cost=0.0,
-                        )
-                    )
-                except Exception:
-                    logger.exception(
-                        "usage_reporter.report_execution failed for"
-                        f" execution_id={adk_session_id!r}"
-                        f" impl={ep_impl_for('usage_reporter')!r}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Error processing request: {str(e)}")
-                raise InternalServerError(str(e)) from e
+                )
+            except Exception:
+                logger.exception(
+                    "usage_reporter.report_execution failed for"
+                    f" execution_id={adk_session_id!r}"
+                    f" impl={ep_impl_for('usage_reporter')!r}"
+                )
 
             # Note: We no longer save the entire session to memory at the end
             # Events are saved individually during execution (FIFO)
@@ -545,6 +578,9 @@ class StandardRunner:
 
         except AgentNotFoundError as e:
             logger.error(f"Agent not found: {str(e)}")
+            raise e
+        except LLMRateLimitError as e:
+            logger.error(f"LLM rate limit: {str(e)}")
             raise e
         except Exception as e:
             logger.error(f"Internal error processing request: {str(e)}", exc_info=True)

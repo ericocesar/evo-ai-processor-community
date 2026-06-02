@@ -17,7 +17,7 @@ class EvoCrmClient:
     """HTTP client for Evo AI CRM API with service token authentication."""
 
     def __init__(self):
-        """Initialize the Evo CRM client with configuration from environment."""
+        """Initialize the BChat CRM client with configuration from environment."""
         self.api_token = os.getenv("EVOAI_CRM_API_TOKEN")
         self.base_url = os.getenv("EVO_AI_CRM_URL", "http://localhost:3000")
         

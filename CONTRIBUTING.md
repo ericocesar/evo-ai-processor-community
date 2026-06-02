@@ -1,6 +1,6 @@
-# Contributing to Evo CRM Agent Processor
+# Contributing to BChat CRM Agent Processor
 
-Thanks for your interest in contributing to Evo CRM Agent Processor! This document
+Thanks for your interest in contributing to BChat CRM Agent Processor! This document
 outlines how to contribute effectively.
 
 ## Code of Conduct
@@ -81,7 +81,7 @@ governed separately by [TRADEMARKS.md](./TRADEMARKS.md).
 - **Documentation**: [docs.evolutionfoundation.com.br](https://docs.evolutionfoundation.com.br)
 - **Email**: suporte@evofoundation.com.br
 
-Thanks for helping make Evo CRM Agent Processor better!
+Thanks for helping make BChat CRM Agent Processor better!
 
 ---
 

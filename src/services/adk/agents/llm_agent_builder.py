@@ -311,6 +311,64 @@ async def update_current_time(callback_context: CallbackContext):
     callback_context.state["_datetime"] = now.isoformat()
 
 
+async def sanitize_function_call_names_callback(
+    callback_context: CallbackContext, llm_response: LlmResponse
+) -> Optional[LlmResponse]:
+    """Sanitize function call names by stripping Gemini commentary/thinking tokens.
+
+    Some Gemini models append <|channel|>commentary or <|channel|>thinking
+    tokens to function call names when interleaving reasoning with tool calls.
+    This callback strips those tokens so tool dispatch succeeds.
+    """
+    try:
+        if not llm_response or not llm_response.content or not llm_response.content.parts:
+            return llm_response
+
+        import copy
+        import re
+        from google.genai import types
+
+        modified = False
+        new_parts = []
+        for part in llm_response.content.parts:
+            if part.function_call and part.function_call.name:
+                original_name = part.function_call.name
+                # Strip Gemini <|channel|>... suffix.
+                # Gemini may append tokens like <|channel|>commentary or
+                # <|channel|>thinking to function call names. The suffix
+                # may include spaces, punctuation, or any character content
+                # from the system prompt.  Use .* (no anchor) to catch
+                # everything after <|channel|>, regardless of content.
+                cleaned_name = re.sub(r"\s*<\|channel\|>.*", "", original_name).strip()
+                if cleaned_name != original_name:
+                    logger.warning(
+                        f"Sanitized function call name: '{original_name}' -> '{cleaned_name}'"
+                    )
+                    new_part = copy.deepcopy(part)
+                    new_part.function_call.name = cleaned_name
+                    new_parts.append(new_part)
+                    modified = True
+                else:
+                    new_parts.append(part)
+            else:
+                new_parts.append(part)
+
+        if modified:
+            new_response = LlmResponse(
+                content=types.Content(
+                    role=llm_response.content.role,
+                    parts=new_parts,
+                ),
+                grounding_metadata=llm_response.grounding_metadata,
+            )
+            return new_response
+
+        return llm_response
+    except Exception as e:
+        logger.error(f"Error in sanitize_function_call_names_callback: {e}")
+        return llm_response
+
+
 async def advanced_usage_tracker(
     callback_context: CallbackContext, llm_response: LlmResponse
 ) -> Optional[LlmResponse]:
@@ -780,8 +838,11 @@ class LlmAgentBuilder:
 
         if allow_manage_labels:
             crm_tools_instructions.append(
-                "Manage Conversation Labels Tool: Available. Use this tool to tag the current conversation with short, lower-case labels (e.g. \"vip\", \"awaiting-payment\", \"followup\") so it can be filtered and routed in the CRM. "
-                "Actions: action=\"list\" returns the current labels; action=\"add\" appends one or more labels preserving the existing ones; action=\"remove\" removes specific labels. "
+                "Manage Conversation Labels Tool: Available. "
+                "IMPORTANT: the exact function name is `manage_conversation_labels`. "
+                "Do NOT call `add_label`, `remove_label`, `label_add`, `label_remove` or any other variant — only `manage_conversation_labels`. "
+                "Use this tool to tag the current conversation with short, lower-case labels (e.g. \"vip\", \"awaiting-payment\", \"followup\") so it can be filtered and routed in the CRM. "
+                "Call manage_conversation_labels with: action=\"list\" to get current labels; action=\"add\" to append one or more labels preserving existing ones; action=\"remove\" to remove specific labels. "
                 "Always prefer calling action=\"list\" first when you are unsure which labels are already attached, then decide whether to add or remove. "
                 "Only manage labels when the user's request, the conversation state or your routing rules clearly justify it — do not invent random tags."
             )
@@ -831,7 +892,7 @@ class LlmAgentBuilder:
                     except (TypeError, ValueError):
                         price_str = f"{currency} {price}"
 
-                pieces = [f"[{kind}] {name}"]
+                pieces = [f"[{kind}] {name} (ID: {product.get('id')})"]
                 if price_str:
                     pieces.append(price_str)
                 if url:
@@ -1116,6 +1177,16 @@ class LlmAgentBuilder:
                 except Exception as e:
                     logger.error(f"❌ Error calling to_function_declaration() on {mcp_tools[0].name}: {e}")
         
+        after_model_callbacks = []
+
+        after_model_callbacks.append(
+            sanitize_function_call_names_callback
+        )
+
+        # Only add advanced_usage_tracker if it's not already in the list
+        # advanced_usage_tracker is currently a no-op passthrough
+        # after_model_callbacks.append(advanced_usage_tracker)
+
         llm_agent_kwargs = {
             "name": agent.name,
             "model": LiteLlm(model=agent.model, api_key=api_key),
@@ -1123,7 +1194,7 @@ class LlmAgentBuilder:
             "description": agent.description,
             "tools": all_tools,
             "before_agent_callback": combined_callback,
-            # "after_model_callback": advanced_usage_tracker,
+            "after_model_callback": after_model_callbacks,
         }
 
         if (

@@ -10,7 +10,7 @@ A tool aceita URL pública ou base64 do arquivo (PDF ou imagem).
 import base64
 import logging
 from typing import Optional
-from google.adk.tools import FunctionTool
+from google.adk.tools import FunctionTool, ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +32,9 @@ def create_parse_fatura_tool() -> FunctionTool:
     """Factory que cria a tool parse_fatura_energia para o ADK."""
 
     async def parse_fatura_energia(
-        fonte: str,
+        fonte: Optional[str] = None,
         content_type: str = "application/pdf",
+        tool_context: ToolContext = None,
     ) -> dict:
         """Extrai dados estruturados de uma fatura de energia elétrica (PDF ou imagem).
 
@@ -41,8 +42,15 @@ def create_parse_fatura_tool() -> FunctionTool:
         para análise. Ela extrai automaticamente os campos necessários para
         a qualificação (valor, concessionária, consumo, vencimento, etc.).
 
+        Quando o usuário ENVIAR um arquivo (PDF ou imagem) na mensagem,
+        chame esta ferramenta SEM fornecer o parâmetro 'fonte' — ela carregará
+        o arquivo automaticamente da sessão.
+
+        Quando o arquivo vier como URL ou base64 explícito, passe em 'fonte'.
+
         Args:
-            fonte: URL pública do arquivo OU string base64 do conteúdo.
+            fonte: (Opcional) URL pública do arquivo OU string base64 do conteúdo.
+                   Se omitido, a ferramenta carrega o arquivo mais recente da sessão.
                    Exemplos:
                    - "https://exemplo.com/fatura.pdf"
                    - "JVBERi0xLjQgMSAwIG9iag==" (base64)
@@ -73,20 +81,62 @@ def create_parse_fatura_tool() -> FunctionTool:
         # Normalizar content_type
         content_type_clean = content_type.split(";")[0].strip().lower()
 
-        # Validar MIME type
-        if content_type_clean not in _MIME_PERMITIDOS:
-            return {
-                "sucesso": False,
-                "mensagem_erro": (
-                    f"Tipo de arquivo não suportado: '{content_type_clean}'. "
-                    f"Tipos aceitos: PDF, PNG, JPEG, WEBP."
-                ),
-            }
+        # Se fonte não for fornecido (ou for "undefined"), carregar da sessão
+        _fonte = (fonte or "").strip()
+        if not _fonte or _fonte.lower() == "undefined":
+            if tool_context is None:
+                return {
+                    "sucesso": False,
+                    "mensagem_erro": "Nenhum arquivo fornecido e contexto de sessão indisponível.",
+                }
+            try:
+                artifact_keys = await tool_context.list_artifact_keys()
+                # Filtrar por extensões de fatura (PDF e imagens)
+                _fatura_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif")
+                fatura_keys = [k for k in artifact_keys if k.lower().endswith(_fatura_exts)]
+                if not fatura_keys:
+                    return {
+                        "sucesso": False,
+                        "mensagem_erro": (
+                            "Nenhum arquivo de fatura encontrado na sessão. "
+                            "Peça ao usuário que envie o arquivo PDF ou imagem da fatura."
+                        ),
+                    }
+                # Pegar o mais recente (último da lista)
+                artifact_filename = fatura_keys[-1]
+                artifact_part = await tool_context.load_artifact(filename=artifact_filename)
+                if artifact_part is None or not (hasattr(artifact_part, "inline_data") and artifact_part.inline_data):
+                    return {
+                        "sucesso": False,
+                        "mensagem_erro": f"Não foi possível carregar o arquivo '{artifact_filename}' da sessão.",
+                    }
+                file_bytes = artifact_part.inline_data.data
+                content_type_clean = artifact_part.inline_data.mime_type or content_type_clean
+                logger.info(f"parse_fatura_energia: carregando '{artifact_filename}' da sessão ({len(file_bytes)} bytes)")
+            except Exception as artifact_err:
+                logger.error(f"Erro ao carregar artefato da sessão: {artifact_err}")
+                return {
+                    "sucesso": False,
+                    "mensagem_erro": f"Erro ao acessar o arquivo da sessão: {str(artifact_err)}",
+                }
 
-        file_bytes: Optional[bytes] = None
+            # Processar conforme tipo
+            is_pdf = "pdf" in content_type_clean
+            result = parse_fatura(
+                pdf_bytes=file_bytes if is_pdf else None,
+                image_bytes=file_bytes if not is_pdf else None,
+                content_type=content_type_clean,
+            )
+            if not is_pdf and not result.get("campos"):
+                result["aviso"] = (
+                    "Imagem recebida. Para extrair dados de imagens de fatura, "
+                    "descreva os campos visíveis na imagem para o usuário ou utilize "
+                    "um modelo de visão computacional."
+                )
+            return result
 
-        # Determinar se fonte é URL ou base64
-        fonte_stripped = fonte.strip()
+        # A partir daqui: fonte foi fornecido explicitamente
+        fonte_stripped = _fonte
         is_url = fonte_stripped.startswith("http://") or fonte_stripped.startswith("https://")
 
         if is_url:

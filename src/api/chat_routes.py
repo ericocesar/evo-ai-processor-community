@@ -49,7 +49,7 @@ from src.services.adk.agent_runner import (
     run_agent_stream,
     run_agent_live,
 )
-from src.core.exceptions import AgentNotFoundError
+from src.core.exceptions import AgentNotFoundError, LLMRateLimitError
 from src.services.service_providers import (
     session_service,
     artifacts_service,
@@ -241,6 +241,16 @@ async def websocket_chat(
                                 },
                                 "turn_complete": True,
                                 "error_type": "session_limit",
+                            }
+                        )
+                    elif isinstance(stream_error, LLMRateLimitError):
+                        await websocket.send_json(
+                            {
+                                "message": {
+                                    "error": f"LLM rate limit: {str(stream_error)}"
+                                },
+                                "turn_complete": True,
+                                "error_type": "llm_rate_limit",
                             }
                         )
                     elif isinstance(stream_error, MemoryLimitExceeded):
@@ -662,6 +672,14 @@ async def chat(
             code=map_status_to_error_code(status.HTTP_404_NOT_FOUND),
             message=str(e),
             status_code=status.HTTP_404_NOT_FOUND
+        )
+    except LLMRateLimitError as e:
+        logger.warning(f"LLM rate limit for agent {agent_id}, user {user_id}: {str(e)}")
+        return error_response(
+            request=request,
+            code=map_status_to_error_code(status.HTTP_429_TOO_MANY_REQUESTS),
+            message=str(e),
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS
         )
     except MemoryLimitExceeded as e:
         logger.warning(f"Memory limit exceeded for user {user_id}: {str(e)}")

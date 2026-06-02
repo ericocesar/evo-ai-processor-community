@@ -18,6 +18,9 @@ from .via_cep import create_via_cep_tool
 # Knowledge Nexus tools are imported lazily inside tool_builder.py to avoid circular imports
 # They are accessed via: from src.services.adk.tools.knowledge_nexus import create_knowledge_nexus_search_tool
 
+# Fatura de energia parser tool — activated via enable_fatura_parser flag in agent config
+# They are accessed via: from src.services.adk.tools.fatura_energia import create_parse_fatura_tool
+
 __all__ = [
     "exit_loop",
     "create_text_to_speech_tool",

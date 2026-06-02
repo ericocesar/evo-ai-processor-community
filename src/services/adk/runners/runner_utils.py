@@ -36,12 +36,13 @@ from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactServ
 from google.adk.events import Event, EventActions
 import time
 from src.utils.logger import setup_logger
-from src.core.exceptions import AgentNotFoundError
+from src.core.exceptions import AgentNotFoundError, LLMRateLimitError
 from src.services.agent_service import get_agent
 from src.services.adk.agent_builder import AgentBuilder
 from src.utils.adk_utils import extract_state_params
 from sqlalchemy.orm import Session
 from typing import Optional, List, Tuple, Dict, Any, Union
+import asyncio
 import base64
 import json
 import uuid
@@ -51,6 +52,107 @@ from datetime import datetime
 from fastapi import HTTPException
 
 logger = setup_logger(__name__)
+
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_RETRY_ATTEMPTS = 3
+INITIAL_RETRY_DELAY_SECONDS = 2.0
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """Detect rate limit errors from LLM providers (OpenRouter, LiteLLM, etc.)."""
+    error_str = str(exception).lower()
+    rate_limit_markers = [
+        "rate_limit",
+        "rate limit",
+        "ratelimiterror",
+        "429",
+        "rate-limited",
+        "temporarily rate-limited",
+        "provider returned error",
+    ]
+    return any(marker in error_str for marker in rate_limit_markers)
+
+
+def is_file_unsupported_error(exception: Exception) -> bool:
+    """Detect file/image type not supported errors from LLM providers.
+
+    Triggered when a model (e.g. Xiaomi via OpenRouter) rejects inline_data
+    (images, PDFs, etc.) because it does not support multimodal content.
+    """
+    error_str = str(exception)
+    markers = [
+        "file type is not supported",
+        "unsupported file type",
+        "image type not supported",
+        "file format not supported",
+    ]
+    return any(marker in error_str.lower() for marker in markers)
+
+
+def is_llm_response_parse_error(exception: Exception) -> bool:
+    """Detect LiteLLM response parsing/deserialization errors.
+
+    Triggered when the provider returns a valid HTTP 200 but with a response
+    structure that the current LiteLLM version cannot deserialize (e.g. a new
+    annotation type like 'file' that isn't yet in the Pydantic schema).
+    These errors are NOT retryable — the same request will fail every time.
+    """
+    error_str = str(exception)
+    markers = [
+        "invalid response object",
+        "validationerror",
+        "input should be 'url_citation'",
+        "annotations.0.type",
+        "convert_to_model_response_object",
+        "convert_dict_to_response",
+        # LiteLLM tries to access e.request when wrapping a plain exception
+        "has no attribute 'request'",
+    ]
+    return any(marker in error_str.lower() for marker in markers)
+
+
+async def execute_with_retry(
+    run_async_fn,
+    max_attempts: int = MAX_RETRY_ATTEMPTS,
+    initial_delay: float = INITIAL_RETRY_DELAY_SECONDS,
+    log_context: str = "",
+) -> Any:
+    """Execute an async generator with retry on rate limit errors.
+
+    Yields events from the generator. On rate limit errors, retries with
+    exponential backoff up to max_attempts times. Other exceptions propagate.
+
+    Args:
+        run_async_fn: Async callable that returns an async generator of events.
+        max_attempts: Maximum number of execution attempts.
+        initial_delay: Initial backoff delay in seconds (doubles each attempt).
+        log_context: Optional context string for log messages.
+    """
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async for event in run_async_fn():
+                yield event, None
+            return
+        except (GeneratorExit, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            last_error = e
+            if is_rate_limit_error(e) and attempt < max_attempts:
+                delay = initial_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    f"[{log_context}] Rate limit detected on attempt {attempt}/{max_attempts}. "
+                    f"Retrying in {delay:.1f}s... Error: {str(e)[:200]}"
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
+
+    if last_error:
+        raise LLMRateLimitError(
+            f"[{log_context}] LLM rate limit exceeded after {max_attempts} attempts: {str(last_error)[:300]}"
+        ) from last_error
 
 
 def convert_sets(obj):
@@ -269,48 +371,129 @@ class RunnerUtils:
         external_id: str,
         adk_session_id: str,
     ) -> Tuple[List[Part], List[str]]:
-        """Process uploaded files and return file parts and transcribed audio texts."""
+        """Process uploaded files and return file parts and transcribed audio texts.
+
+        Validates file size (max {} bytes) and base64 decoding. Files exceeding
+        the limit are skipped with a warning log.
+        """.format(MAX_FILE_SIZE_BYTES)
         file_parts = []
         transcribed_texts = []
 
         if files and len(files) > 0:
             for file_data in files:
                 try:
+                    filename = getattr(file_data, "filename", None) or str(file_data.get("filename", "unknown"))
+                    content_type = getattr(file_data, "content_type", None) or str(file_data.get("content_type", ""))
+                    data = getattr(file_data, "data", None) or file_data.get("data", "")
+
                     # Check if file is audio
-                    is_audio = self._is_audio_file(
-                        file_data.content_type, file_data.filename
-                    )
+                    is_audio = self._is_audio_file(content_type, filename)
 
                     logger.info(
-                        f"Processing file: {file_data.filename} (type: {file_data.content_type}, is_audio: {is_audio})"
+                        f"Processing file: {filename} (type: {content_type}, is_audio: {is_audio})"
                     )
 
-                    file_bytes = base64.b64decode(file_data.data)
+                    # Deduplicate: if this file was already attached in a previous turn
+                    # of the current session, skip re-attaching the inline_data.
+                    # Some providers (e.g. Amazon Bedrock) reject conversations that
+                    # contain the same document name in multiple messages.
+                    try:
+                        existing_keys = await artifacts_service.list_artifact_keys(
+                            app_name=agent_id,
+                            user_id=external_id,
+                            session_id=adk_session_id,
+                        )
+                        if filename in existing_keys:
+                            logger.info(
+                                f"File {filename} already exists in session artifacts. "
+                                "Skipping re-attachment to avoid duplicate document errors."
+                            )
+                            file_parts.append(
+                                Part(
+                                    text=f"[O arquivo '{filename}' já foi enviado nesta conversa e está disponível no histórico da sessão.]"
+                                )
+                            )
+                            continue
+                    except Exception as _dedup_err:
+                        logger.warning(
+                            f"Could not check existing artifacts for deduplication ({filename}): {_dedup_err}"
+                        )
+
+                    # Validate base64 data
+                    if not data:
+                        logger.warning(f"Skipping file {filename}: empty data")
+                        continue
+
+                    file_bytes = base64.b64decode(data)
+
+                    # Validate file size
+                    file_size = len(file_bytes)
+                    if file_size > MAX_FILE_SIZE_BYTES:
+                        logger.warning(
+                            f"File {filename} exceeds size limit ({file_size} > {MAX_FILE_SIZE_BYTES} bytes). "
+                            f"Skipping file attachment."
+                        )
+                        continue
+
+                    if file_size == 0:
+                        logger.warning(f"Skipping file {filename}: decoded to 0 bytes")
+                        continue
+
                     file_part = Part(
                         inline_data=Blob(
-                            mime_type=file_data.content_type,
+                            mime_type=content_type,
                             data=file_bytes,
                         )
                     )
 
                     # Always save to artifacts for reference
-                    await artifacts_service.save_artifact(
-                        app_name=agent_id,
-                        user_id=external_id,
-                        session_id=adk_session_id,
-                        filename=file_data.filename,
-                        artifact=file_part,
-                    )
-                    if is_audio:
-                        # Audio file - add to content parts for LLM processing
-                        file_parts.append(file_part)
-                        logger.info(
-                            f"Added audio file {file_data.filename} to content parts for LLM processing"
+                    try:
+                        await artifacts_service.save_artifact(
+                            app_name=agent_id,
+                            user_id=external_id,
+                            session_id=adk_session_id,
+                            filename=filename,
+                            artifact=file_part,
+                        )
+                    except Exception as artifact_error:
+                        logger.warning(
+                            f"Could not save artifact for file {filename}: {artifact_error}"
                         )
 
+                    # Add file to content parts for LLM processing
+                    # Audio files: LLM can transcribe
+                    # Image/PDF files: multimodal LLMs can process
+                    file_parts.append(file_part)
+
+                    # For non-audio files (PDF/images), add a text hint so the LLM
+                    # knows it can call parse_fatura_energia without passing 'fonte'.
+                    # This is needed because the model cannot re-encode inline_data
+                    # back to a base64 string to pass as a tool argument.
+                    if not is_audio:
+                        file_parts.append(
+                            Part(
+                                text=(
+                                    f"[ARQUIVO_RECEBIDO: nome='{filename}', tipo='{content_type}']\n"
+                                    f"O arquivo '{filename}' foi salvo na sess\u00e3o. "
+                                    f"Para analisar esta fatura, chame `parse_fatura_energia()` "
+                                    f"SEM fornecer o par\u00e2metro 'fonte' \u2014 a ferramenta carrega\r\u00e1 "
+                                    f"o arquivo automaticamente da sess\u00e3o."
+                                )
+                            )
+                        )
+
+                    logger.info(
+                        f"Added file {filename} (type: {content_type}, size: {file_size} bytes)"
+                        f" to content parts for LLM processing"
+                    )
+
+                except base64.binascii.Error as e:
+                    logger.error(
+                        f"Base64 decode error for file {getattr(file_data, 'filename', 'unknown')}: {str(e)}"
+                    )
                 except Exception as e:
                     logger.error(
-                        f"Error processing file {file_data.filename}: {str(e)}"
+                        f"Error processing file {getattr(file_data, 'filename', 'unknown')}: {str(e)}"
                     )
 
         return file_parts, transcribed_texts
@@ -372,15 +555,12 @@ class RunnerUtils:
 
     def create_content(self, message: str, file_parts: List[Part]) -> Optional[Content]:
         """Create content with message and file parts."""
-        # If message is empty and no files, return None to indicate no content to process
         if not message.strip() and not file_parts:
             return None
 
-        # If message is empty but files exist, use empty message (let files speak for themselves)
-        if not message.strip() and file_parts:
-            message = ""
-
-        parts = [Part(text=message)]
+        parts: List[Part] = []
+        if message.strip():
+            parts.append(Part(text=message))
         if file_parts:
             parts.extend(file_parts)
         return Content(role="user", parts=parts)
@@ -389,21 +569,37 @@ class RunnerUtils:
         self, message: str, file_parts: List[Part], transcribed_texts: List[str]
     ) -> Optional[Content]:
         """Create content with message, file parts, and transcribed audio texts."""
-        # Build full message with transcribed audio texts
         full_message = message
         if transcribed_texts:
             transcriptions = "\n\n".join(transcribed_texts)
             full_message += f"\n\n{transcriptions}"
 
-        # If both message and transcriptions are empty, and no file parts, return None
         if not full_message.strip() and not file_parts:
             logger.info("Empty message and transcription detected, skipping processing")
             return None
 
-        parts = [Part(text=full_message)]
+        parts: List[Part] = []
+        if full_message.strip():
+            parts.append(Part(text=full_message))
         if file_parts:
             parts.extend(file_parts)
         return Content(role="user", parts=parts)
+
+    def strip_file_parts(self, content: Content) -> Optional[Content]:
+        """Return a copy of content with only text parts, removing any inline_data.
+
+        Used as a fallback when the LLM model does not support file/image content
+        (e.g. 'file type is not supported' error from OpenRouter).
+        """
+        if not content or not content.parts:
+            return content
+        text_parts = [
+            p for p in content.parts
+            if not (hasattr(p, "inline_data") and p.inline_data)
+        ]
+        if not text_parts:
+            return None
+        return Content(role=content.role, parts=text_parts)
 
     def _is_meaningful_transcription(self, transcribed_text: str) -> bool:
         """Check if transcribed text contains meaningful content."""

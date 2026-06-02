@@ -80,6 +80,15 @@ class InvalidRequestError(BaseAPIException):
         )
 
 
+class LLMRateLimitError(BaseAPIException):
+    """Exception when LLM provider rate limits the request."""
+
+    def __init__(self, message: str = "LLM provider rate limit exceeded", details: Optional[Dict[str, Any]] = None):
+        super().__init__(
+            status_code=429, message=message, error_code=INTERNAL_ERROR, details=details,
+        )
+
+
 class InternalServerError(BaseAPIException):
     """Exception for server errors"""
 
